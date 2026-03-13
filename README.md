@@ -382,6 +382,119 @@ The transition period for old SCCs ended **December 27, 2022**. Any transfer sti
 
 ---
 
+## Security Hardening (Production Deployment)
+
+This tool is designed to process sensitive compliance data — architecture diagrams that enumerate internal services, data categories, and legal mechanisms. In a real production environment (e.g., integrated into a CI/CD pipeline, deployed as an internal API, or run by a compliance team), the following security controls would be applied. They are omitted from this repository because the challenge scope is a CLI tool validated in a public repo, but they are non-negotiable for any production use.
+
+---
+
+### 1. Input Validation and Sanitization
+
+The `ArchitectureLoader` currently validates required fields and rejects malformed JSON, but a production hardening layer would add:
+
+**JSON Schema validation** using `jsonschema` to enforce the exact shape of the input before any parsing occurs. This prevents unexpected fields from being silently ignored and ensures that enum values (e.g., `legal_basis`, `frequency`) only contain known strings, rejecting inputs like `"legal_basis": "<script>alert(1)</script>"` before they reach business logic.
+
+```python
+# Example: strict schema validation before parse()
+import jsonschema
+
+ARCHITECTURE_SCHEMA = {
+    "type": "object",
+    "required": ["organization", "services", "data_flows"],
+    "additionalProperties": False,
+    "properties": {
+        "organization": {"type": "object"},
+        "services": {"type": "array", "maxItems": 500},
+        "third_party_vendors": {"type": "array", "maxItems": 500},
+        "data_flows": {"type": "array", "maxItems": 2000},
+    }
+}
+
+jsonschema.validate(data, ARCHITECTURE_SCHEMA)  # raises ValidationError on violation
+```
+
+**File size limits** would be enforced before reading — a 50 MB JSON file is almost certainly malicious or malformed, and reading it into memory without a cap is a denial-of-service vector.
+
+**Path traversal prevention** for the `--output` flag: the output directory would be resolved with `pathlib.Path.resolve()` and validated against an allowlist of permitted directories before writing any file.
+
+---
+
+### 2. Secrets and Credential Management
+
+The architecture input file may contain sensitive metadata (e.g., vendor names, internal service topology). In a production deployment:
+
+- **No secrets in input files.** API keys, connection strings, or tokens must never appear in the architecture JSON. The schema validator would explicitly reject any field matching common secret patterns (e.g., fields named `api_key`, `password`, `token`).
+- **Environment variables via a secrets manager.** Any credentials needed by the tool (e.g., for pushing reports to an internal storage bucket) would be injected via environment variables loaded from HashiCorp Vault, AWS Secrets Manager, or Azure Key Vault — never from `.env` files committed to version control.
+- **`.gitignore` enforcement.** A pre-commit hook (via `pre-commit`) would block commits containing files matching `*.env`, `*secret*`, `*credential*`, or any file containing strings matching common secret patterns (using `detect-secrets` or `trufflehog`).
+
+---
+
+### 3. Authentication and Authorization
+
+If the validator were exposed as an internal HTTP API (e.g., for integration with a compliance dashboard):
+
+- **Mutual TLS (mTLS)** between internal services, so only authorized clients with a valid certificate can submit architecture files for validation.
+- **Role-based access control (RBAC):** only members of the `compliance-team` or `security-team` groups (enforced via an identity provider like Okta or Azure AD) can submit validation requests or retrieve reports. Read-only roles would be available for engineering teams to view their own service's findings.
+- **Request signing** for CI/CD integrations: pipeline jobs would sign requests with a short-lived token (e.g., a GitHub Actions OIDC token or a Vault-issued JWT) so the validator can verify the request originated from a trusted pipeline and not an external actor.
+
+---
+
+### 4. Output Security
+
+The generated HTML and JSON reports contain compliance findings that could reveal internal architecture details if leaked:
+
+- **Reports are internal-only artifacts.** They would never be published to public URLs. Storage would be in a private S3 bucket (or equivalent) with bucket policies blocking public access and enforcing server-side encryption (SSE-S3 or SSE-KMS).
+- **Report access control.** Each report would be tagged with the submitting user's identity and accessible only to that user and compliance officers, enforced at the storage layer.
+- **HTML report sanitization.** The current HTML reporter uses Python's `html.escape()` for all user-supplied strings, preventing XSS if reports are rendered in a browser. In production, a Content Security Policy (CSP) header would be added to the serving layer: `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`.
+- **No sensitive data in logs.** The CLI's logging would be audited to ensure that data category names, service names, and legal basis values are not written to stdout in environments where logs are aggregated (e.g., Splunk, Datadog). A `--redact-logs` flag would replace service names with anonymized identifiers in log output.
+
+---
+
+### 5. Dependency Security
+
+- **Pinned dependencies with hash verification.** `requirements.txt` would use exact version pins with `--hash=sha256:...` entries generated by `pip-compile --generate-hashes`, preventing supply chain attacks via compromised package versions.
+- **Automated vulnerability scanning.** `dependabot` (or `renovate`) would be configured to open PRs for dependency updates. `pip-audit` or `safety` would run in CI to block merges if any dependency has a known CVE.
+- **Minimal dependency surface.** The current tool has zero runtime dependencies beyond the Python standard library (PyYAML is optional). This is intentional — every additional dependency is an attack surface. Production additions (e.g., `jsonschema`) would be evaluated for their own dependency trees.
+
+---
+
+### 6. CI/CD Pipeline Security
+
+In a production CI/CD pipeline (e.g., GitHub Actions, GitLab CI):
+
+- **SAST (Static Application Security Testing)** with `bandit` would run on every PR to catch common Python security issues (e.g., use of `eval()`, `subprocess` with shell=True, hardcoded credentials).
+- **Secret scanning** with `trufflehog` or GitHub's native secret scanning would block any commit containing credential patterns.
+- **Least-privilege pipeline tokens.** The GitHub Actions workflow would use OIDC-based authentication (no long-lived tokens stored as secrets) and request only the minimum permissions needed (`contents: read` for checkout, `id-token: write` for OIDC).
+- **Signed commits and tags.** Releases would require GPG-signed commits and tags, so consumers of the tool can verify the release artifact was produced by an authorized maintainer.
+- **Reproducible builds.** The Docker image (if containerized) would be built from a pinned base image digest (not a floating tag like `python:3.11`) and published with a provenance attestation (SLSA Level 2).
+
+---
+
+### 7. Data Residency and Retention
+
+Given that this tool processes GDPR compliance data, it would itself need to comply with GDPR:
+
+- **No persistent storage of input files.** Architecture files submitted for validation would be processed in memory and discarded immediately after report generation. They would never be written to disk on a shared server.
+- **Report retention policy.** Generated reports would be retained for a configurable period (default: 90 days) and then automatically deleted, consistent with Art. 5(1)(e) storage limitation.
+- **Data residency.** If deployed in the EU, all processing and storage would remain within EU regions. Cross-border transfer of the compliance reports themselves (which contain architecture metadata) would require the same legal basis analysis that the tool performs for its users.
+
+---
+
+### Security Controls Summary
+
+| Layer | Control | Tool / Mechanism |
+|---|---|---|
+| Input validation | JSON Schema enforcement, file size limits, path traversal prevention | `jsonschema`, `pathlib` |
+| Secrets management | No secrets in input; secrets manager integration | HashiCorp Vault / AWS Secrets Manager |
+| Dependency security | Pinned hashes, CVE scanning, minimal surface | `pip-compile --generate-hashes`, `pip-audit` |
+| Authentication | mTLS for API; RBAC via IdP; OIDC tokens for CI | Okta/Azure AD, GitHub OIDC |
+| Output security | Private storage, access control, HTML escaping, CSP | S3 private bucket, `html.escape()` |
+| SAST | Static analysis on every PR | `bandit`, `trufflehog` |
+| Build integrity | Signed commits/tags, pinned base images, SLSA provenance | GPG, Docker digest pinning |
+| Data residency | In-memory processing, configurable retention, EU-only storage | Architecture + policy |
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
