@@ -467,3 +467,384 @@ class TestEdgeCases:
         # Should not raise
         result = v.validate_flow(flow)
         assert result is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Data minimization analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDataMinimization:
+    def test_excessive_recipients_flagged(self):
+        """More than 4 recipients for same data category triggers minimization concern."""
+        svc_eu = make_service("api-eu", "Ireland", is_controller=True)
+        flows = [
+            make_flow(f"f{i}", "api-eu", f"vendor-{i}", "United States",
+                      legal_basis="SCC", data_categories=["transaction_data"])
+            for i in range(1, 6)  # 5 recipients
+        ]
+        v = make_validator([svc_eu], flows)
+        concerns = v.analyze_minimization()
+        assert any(c.data_category == "transaction_data" for c in concerns)
+
+    def test_indefinite_retention_flagged(self):
+        """Services with indefinite retention period trigger minimization concern."""
+        svc_eu = make_service("api-eu", "Ireland", retention_period="indefinite")
+        v = make_validator([svc_eu], [])
+        concerns = v.analyze_minimization()
+        assert len(concerns) >= 1
+        assert any("indefinite" in c.description.lower() for c in concerns)
+
+    def test_normal_recipients_not_flagged(self):
+        """3 recipients for same data category does NOT trigger minimization concern."""
+        svc_eu = make_service("api-eu", "Ireland")
+        flows = [
+            make_flow(f"f{i}", "api-eu", f"vendor-{i}", "United States",
+                      legal_basis="SCC", data_categories=["transaction_data"])
+            for i in range(1, 4)  # 3 recipients — below threshold
+        ]
+        v = make_validator([svc_eu], flows)
+        concerns = v.analyze_minimization()
+        category_concerns = [c for c in concerns if c.data_category == "transaction_data"]
+        assert len(category_concerns) == 0
+
+    def test_sensitive_data_without_dpa_flagged(self):
+        """Sensitive data flowing to vendor without DPA triggers minimization concern."""
+        svc_eu = make_service("api-eu", "Ireland")
+        vendor = ThirdPartyVendor(
+            name="biometrics-vendor",
+            display_name="Biometrics Vendor",
+            country="United States",
+            region="us-east-1",
+            purpose="Identity verification",
+            data_categories=["biometric_data"],
+            legal_basis="SCC",
+            dpf_certified=False,
+            processor_agreement=False,  # No DPA!
+        )
+        flow = make_flow(
+            "f1", "api-eu", "biometrics-vendor", "United States",
+            legal_basis="SCC", data_categories=["biometric_data"]
+        )
+        v = make_validator([svc_eu], [flow], vendors_list=[vendor])
+        concerns = v.analyze_minimization()
+        assert any("biometric" in c.data_category.lower() for c in concerns)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. GDPR/PCI DSS conflict detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestComplianceConflicts:
+    def test_audit_log_flow_triggers_conflict(self):
+        """Flows with 'audit' in service name trigger GDPR/PCI DSS conflict."""
+        svc_eu = make_service("audit_log_service", "Ireland")
+        svc_us = make_service("siem-us", "United States")
+        flow = make_flow(
+            "f1", "audit_log_service", "siem-us", "United States",
+            legal_basis="SCC", purpose="Security audit logging"
+        )
+        v = make_validator([svc_eu, svc_us], [flow])
+        conflicts = v.detect_compliance_conflicts()
+        assert len(conflicts) >= 1
+        assert conflicts[0].requires_legal_review is True
+
+    def test_fraud_flow_to_high_risk_triggers_conflict(self):
+        """Fraud detection flows to high-risk jurisdictions trigger conflict."""
+        svc_eu = make_service("fraud-detector", "Ireland")
+        svc_us = make_service("ml-vendor", "United States")
+        flow = make_flow(
+            "f1", "fraud-detector", "ml-vendor", "United States",
+            legal_basis="SCC", purpose="fraud prevention and detection"
+        )
+        v = make_validator([svc_eu, svc_us], [flow])
+        conflicts = v.detect_compliance_conflicts()
+        assert len(conflicts) >= 1
+
+    def test_no_conflict_for_normal_payment_flow(self):
+        """Normal payment flows without audit/fraud purpose don't trigger conflicts."""
+        svc_eu = make_service("checkout-api", "Ireland")
+        svc_us = make_service("payment-processor", "United States")
+        flow = make_flow(
+            "f1", "checkout-api", "payment-processor", "United States",
+            legal_basis="SCC", purpose="Payment authorization"
+        )
+        v = make_validator([svc_eu, svc_us], [flow])
+        conflicts = v.detect_compliance_conflicts()
+        assert len(conflicts) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. ArchitectureLoader edge cases
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestArchitectureLoaderEdgeCases:
+    def test_load_json_valid_file(self, tmp_path):
+        """Valid JSON file loads successfully."""
+        data = {
+            "organization": {"name": "Test Corp", "country": "Ireland"},
+            "services": [],
+            "third_party_vendors": [],
+            "data_flows": []
+        }
+        f = tmp_path / "arch.json"
+        f.write_text(json.dumps(data))
+        result = ArchitectureLoader.load(str(f))
+        assert result["organization"]["name"] == "Test Corp"
+
+    def test_load_json_invalid_file_raises(self, tmp_path):
+        """Malformed JSON raises json.JSONDecodeError."""
+        import json as json_module
+        f = tmp_path / "bad.json"
+        f.write_text("{invalid json: }")
+        with pytest.raises(json_module.JSONDecodeError):
+            ArchitectureLoader.load(str(f))
+
+    def test_parse_empty_architecture(self):
+        """Empty architecture parses without errors."""
+        data = {
+            "organization": {"name": "Empty Corp"},
+            "services": [],
+            "third_party_vendors": [],
+            "data_flows": []
+        }
+        services, vendors, flows, org = ArchitectureLoader.parse(data)
+        assert len(services) == 0
+        assert len(vendors) == 0
+        assert len(flows) == 0
+        assert org["name"] == "Empty Corp"
+
+    def test_parse_missing_optional_fields_uses_defaults(self):
+        """Missing optional fields in services/flows use sensible defaults."""
+        data = {
+            "organization": {"name": "Minimal Corp"},
+            "services": [
+                {"name": "api", "region": "eu-west-1", "country": "Ireland"}
+            ],
+            "third_party_vendors": [],
+            "data_flows": [
+                {
+                    "id": "f1",
+                    "from": "api",
+                    "to": "external",
+                    "to_country": "United States"
+                }
+            ]
+        }
+        services, vendors, flows, org = ArchitectureLoader.parse(data)
+        assert services["api"].cloud_provider == "Unknown"
+        assert flows[0].legal_basis is None
+        assert flows[0].tia_conducted is False
+
+    def test_parse_missing_organization_uses_defaults(self):
+        """Missing organization key returns empty dict gracefully."""
+        data = {
+            "services": [],
+            "third_party_vendors": [],
+            "data_flows": []
+        }
+        services, vendors, flows, org = ArchitectureLoader.parse(data)
+        assert isinstance(org, dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. Sensitive data handling
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSensitiveDataHandling:
+    def test_biometric_data_triggers_sensitive_finding(self):
+        """Biometric data transfers generate SENSITIVE_DATA_TRANSFER finding."""
+        svc_eu = make_service("api-eu", "Ireland")
+        flow = make_flow(
+            "f1", "api-eu", "vendor-us", "United States",
+            legal_basis="SCC",
+            data_categories=["biometric_data", "transaction_data"]
+        )
+        v = make_validator([svc_eu], [flow])
+        result = v.validate_flow(flow)
+        finding_types = [f.finding_type for f in result.findings]
+        assert FindingType.SENSITIVE_DATA_TRANSFER in finding_types
+
+    def test_health_data_triggers_sensitive_finding(self):
+        """Health data transfers generate SENSITIVE_DATA_TRANSFER finding."""
+        svc_eu = make_service("api-eu", "Ireland")
+        flow = make_flow(
+            "f1", "api-eu", "vendor-us", "United States",
+            legal_basis="SCC",
+            data_categories=["health_data"]
+        )
+        v = make_validator([svc_eu], [flow])
+        result = v.validate_flow(flow)
+        finding_types = [f.finding_type for f in result.findings]
+        assert FindingType.SENSITIVE_DATA_TRANSFER in finding_types
+
+    def test_non_sensitive_data_no_sensitive_finding(self):
+        """Non-sensitive data transfers do NOT generate SENSITIVE_DATA_TRANSFER finding."""
+        svc_eu = make_service("api-eu", "Ireland")
+        flow = make_flow(
+            "f1", "api-eu", "vendor-jp", "Japan",
+            legal_basis="adequacy_decision",
+            data_categories=["contact_details", "transaction_data"]
+        )
+        v = make_validator([svc_eu], [flow])
+        result = v.validate_flow(flow)
+        finding_types = [f.finding_type for f in result.findings]
+        assert FindingType.SENSITIVE_DATA_TRANSFER not in finding_types
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. Article 30 inventory generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestArticle30Generation:
+    def test_controller_service_generates_entry(self):
+        """Controller services generate Article 30 entries."""
+        svc_eu = make_service(
+            "checkout-api", "Ireland",
+            is_controller=True,
+            purpose="Payment processing",
+            data_categories=["transaction_data", "contact_details"],
+        )
+        svc_us = make_service("stripe", "United States")
+        flow = make_flow(
+            "f1", "checkout-api", "stripe", "United States",
+            legal_basis="SCC"
+        )
+        v = make_validator([svc_eu, svc_us], [flow])
+        results = v.validate_all()
+        entries = v.generate_article30(results)
+        assert len(entries) >= 1
+        assert any("checkout-api" in e.activity_name or "Payment" in e.activity_name for e in entries)
+
+    def test_non_controller_service_no_entry(self):
+        """Non-controller services do NOT generate Article 30 entries."""
+        svc_eu = make_service(
+            "api-eu", "Ireland",
+            is_controller=False,  # Not a controller
+        )
+        v = make_validator([svc_eu], [])
+        results = v.validate_all()
+        entries = v.generate_article30(results)
+        assert len(entries) == 0
+
+    def test_article30_entry_has_required_fields(self):
+        """Article 30 entries contain all required GDPR fields."""
+        svc_eu = make_service(
+            "checkout-api", "Ireland",
+            is_controller=True,
+            purpose="Payment processing",
+        )
+        svc_us = make_service("stripe", "United States")
+        flow = make_flow("f1", "checkout-api", "stripe", "United States", legal_basis="SCC")
+        v = make_validator([svc_eu, svc_us], [flow])
+        results = v.validate_all()
+        entries = v.generate_article30(results)
+        assert len(entries) >= 1
+        entry = entries[0]
+        assert entry.activity_name
+        assert entry.controller
+        assert entry.purpose
+        assert entry.data_subjects
+        assert entry.data_categories
+        assert entry.recipients
+        assert entry.retention_period
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. Severity escalation logic
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSeverityEscalation:
+    def test_critical_finding_makes_non_compliant(self):
+        """Any CRITICAL finding results in NON_COMPLIANT status."""
+        svc_eu = make_service("api-eu", "Ireland")
+        svc_us = make_service("api-us", "United States")
+        flow = make_flow("f1", "api-eu", "api-us", "United States", legal_basis=None)
+        v = make_validator([svc_eu, svc_us], [flow])
+        result = v.validate_flow(flow)
+        assert result.status == ComplianceStatus.NON_COMPLIANT
+        critical = [f for f in result.findings if f.severity == Severity.CRITICAL]
+        assert len(critical) >= 1
+
+    def test_missing_tia_makes_tia_required(self):
+        """Missing TIA for US transfer results in COMPLIANT_TIA_REQUIRED."""
+        svc_eu = make_service("api-eu", "Ireland")
+        svc_us = make_service("api-us", "United States")
+        flow = make_flow("f1", "api-eu", "api-us", "United States",
+                         legal_basis="SCC", tia_conducted=False)
+        v = make_validator([svc_eu, svc_us], [flow])
+        result = v.validate_flow(flow)
+        assert result.status == ComplianceStatus.COMPLIANT_TIA_REQUIRED
+
+    def test_tia_conducted_improves_status(self):
+        """Conducted TIA for US transfer with SCC results in REQUIRES_LEGAL_REVIEW (not TIA_REQUIRED)."""
+        svc_eu = make_service("api-eu", "Ireland")
+        svc_us = make_service("api-us", "United States")
+        flow = make_flow("f1", "api-eu", "api-us", "United States",
+                         legal_basis="SCC", tia_conducted=True)
+        v = make_validator([svc_eu, svc_us], [flow])
+        result = v.validate_flow(flow)
+        # With TIA conducted, should not be COMPLIANT_TIA_REQUIRED
+        assert result.status != ComplianceStatus.COMPLIANT_TIA_REQUIRED
+
+    def test_intra_eea_always_not_applicable(self):
+        """Intra-EEA flows are always NOT_APPLICABLE regardless of legal basis."""
+        svc_de = make_service("api-de", "Germany")
+        svc_fr = make_service("api-fr", "France")
+        # Even with no legal basis, intra-EEA should be NOT_APPLICABLE
+        flow = make_flow("f1", "api-de", "api-fr", "France", legal_basis=None)
+        v = make_validator([svc_de, svc_fr], [flow])
+        result = v.validate_flow(flow)
+        assert result.status == ComplianceStatus.NOT_APPLICABLE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. HTML report generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHTMLReportGeneration:
+    DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "yuno_architecture.json")
+
+    def test_html_report_generates_without_error(self, tmp_path):
+        """HTML report generates without raising exceptions."""
+        from gdpr_validator.reporter import HTMLReporter
+        services, vendors, flows, org = ArchitectureLoader.parse(
+            ArchitectureLoader.load(self.DATA_FILE)
+        )
+        v = GDPRValidator(services=services, vendors=vendors, flows=flows, org=org)
+        report = v.run()
+        html_path = str(tmp_path / "report.html")
+        HTMLReporter().generate(report, html_path)
+        assert os.path.exists(html_path)
+        with open(html_path) as f:
+            content = f.read()
+        assert "<!DOCTYPE html>" in content
+        assert "GDPR" in content
+
+    def test_html_report_contains_findings(self, tmp_path):
+        """HTML report includes findings section when there are findings."""
+        from gdpr_validator.reporter import HTMLReporter
+        services, vendors, flows, org = ArchitectureLoader.parse(
+            ArchitectureLoader.load(self.DATA_FILE)
+        )
+        v = GDPRValidator(services=services, vendors=vendors, flows=flows, org=org)
+        report = v.run()
+        html_path = str(tmp_path / "report.html")
+        HTMLReporter().generate(report, html_path)
+        with open(html_path) as f:
+            content = f.read()
+        assert "Compliance Findings" in content
+        assert "Remediation" in content
+
+    def test_html_report_contains_article30(self, tmp_path):
+        """HTML report includes Article 30 inventory section."""
+        from gdpr_validator.reporter import HTMLReporter
+        services, vendors, flows, org = ArchitectureLoader.parse(
+            ArchitectureLoader.load(self.DATA_FILE)
+        )
+        v = GDPRValidator(services=services, vendors=vendors, flows=flows, org=org)
+        report = v.run()
+        html_path = str(tmp_path / "report.html")
+        HTMLReporter().generate(report, html_path)
+        with open(html_path) as f:
+            content = f.read()
+        assert "Article 30" in content

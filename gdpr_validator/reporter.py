@@ -564,7 +564,7 @@ class ConsoleSummary:
         codes = "".join(self.COLORS.get(c, "") for c in colors)
         return f"{codes}{text}{self.COLORS['reset']}"
 
-    def print(self, r: ValidationReport) -> None:
+    def print(self, r: ValidationReport, verbose: bool = False) -> None:
         print()
         print(self._c("=" * 70, "bold", "blue"))
         print(self._c(f"  GDPR CROSS-BORDER TRANSFER AUDIT — {r.organization}", "bold", "blue"))
@@ -581,8 +581,15 @@ class ConsoleSummary:
         print(f"  Non-Compliant:        {self._c(str(r.non_compliant_flows), 'red', 'bold')}")
         print(f"  Total Findings:       {len(r.findings)}")
         critical = sum(1 for f in r.findings if f.severity == Severity.CRITICAL)
+        high = sum(1 for f in r.findings if f.severity == Severity.HIGH)
         if critical:
             print(f"  Critical Findings:    {self._c(str(critical), 'red', 'bold')} ⚠️")
+        if high:
+            print(f"  High Findings:        {self._c(str(high), 'yellow', 'bold')}")
+        if r.minimization_concerns:
+            print(f"  Minimization Issues:  {self._c(str(len(r.minimization_concerns)), 'cyan', 'bold')}")
+        if r.compliance_conflicts:
+            print(f"  GDPR/PCI Conflicts:   {self._c(str(len(r.compliance_conflicts)), 'magenta', 'bold')}")
         print()
 
         # Non-compliant flows
@@ -592,16 +599,62 @@ class ConsoleSummary:
             for res in non_compliant:
                 print(f"    • {res.flow.id}: {res.flow.from_service} → {res.flow.to_service} ({res.destination_country})")
                 for finding in res.findings:
-                    if finding.severity == Severity.CRITICAL:
-                        print(f"      {self._c('CRITICAL', 'red', 'bold')}: {finding.finding_type}")
+                    if finding.severity in (Severity.CRITICAL, Severity.HIGH):
+                        sev_color = "red" if finding.severity == Severity.CRITICAL else "yellow"
+                        print(f"      {self._c(finding.severity.value, sev_color, 'bold')}: {finding.finding_type.value}")
+                        if verbose:
+                            print(f"        {self._c('Description:', 'gray')} {finding.description}")
+                            print(f"        {self._c('Remediation:', 'green')} {finding.remediation}")
+                            if finding.legal_reference:
+                                print(f"        {self._c('Reference:', 'gray')} {finding.legal_reference}")
             print()
 
         # TIA required
         tia_flows = [res for res in r.transfer_results if res.status == ComplianceStatus.COMPLIANT_TIA_REQUIRED]
         if tia_flows:
-            print(self._c("  ⚠️  TIA REQUIRED", "bold", "yellow"))
+            print(self._c("  ⚠️  TIA REQUIRED (Post-Schrems II)", "bold", "yellow"))
             for res in tia_flows:
                 print(f"    • {res.flow.id}: {res.flow.from_service} → {res.flow.to_service} ({res.destination_country})")
+                if verbose:
+                    for finding in res.findings:
+                        if finding.finding_type == FindingType.MISSING_TIA:
+                            print(f"      {self._c('Reason:', 'gray')} {finding.description}")
+                            print(f"      {self._c('Action:', 'yellow')} {finding.remediation}")
+            print()
+
+        # Legal review flows
+        review_flows = [res for res in r.transfer_results if res.status == ComplianceStatus.REQUIRES_LEGAL_REVIEW]
+        if review_flows:
+            print(self._c("  🔍 REQUIRES LEGAL REVIEW", "bold", "cyan"))
+            for res in review_flows:
+                print(f"    • {res.flow.id}: {res.flow.from_service} → {res.flow.to_service} ({res.destination_country})")
+                if verbose:
+                    for finding in res.findings:
+                        print(f"      {self._c('Note:', 'gray')} {finding.description}")
+            print()
+
+        # Verbose: all findings table
+        if verbose and r.findings:
+            print(self._c("  📊 ALL FINDINGS", "bold"))
+            print("  " + "-" * 68)
+            for i, f in enumerate(r.findings, 1):
+                sev_colors = {Severity.CRITICAL: "red", Severity.HIGH: "yellow",
+                              Severity.MEDIUM: "cyan", Severity.LOW: "blue", Severity.INFO: "gray"}
+                sev_color = sev_colors.get(f.severity, "gray")
+                print(f"  [{i:02d}] {self._c(f.severity.value, sev_color, 'bold')} — {self._c(f.finding_type.value, 'bold')}")
+                print(f"       Flow: {f.flow_id} | {f.source} → {f.destination}")
+                print(f"       {f.description}")
+                print(f"       {self._c('Fix:', 'green')} {f.remediation}")
+                if f.legal_reference:
+                    print(f"       {self._c('Ref:', 'gray')} {f.legal_reference}")
+                print()
+
+        # Minimization concerns
+        if verbose and r.minimization_concerns:
+            print(self._c("  📉 DATA MINIMIZATION CONCERNS", "bold", "cyan"))
+            for c in r.minimization_concerns:
+                print(f"    • {c.data_category}: {c.recipient_count} recipients ({', '.join(c.recipients)})")
+                print(f"      {self._c('Recommendation:', 'green')} {c.recommendation}")
             print()
 
         # Conflicts
@@ -609,6 +662,12 @@ class ConsoleSummary:
             print(self._c(f"  ⚡ COMPLIANCE CONFLICTS: {len(r.compliance_conflicts)} (GDPR vs PCI DSS)", "bold", "magenta"))
             for c in r.compliance_conflicts:
                 print(f"    • {c.flow_id}: {c.source} → {c.destination}")
+                if verbose:
+                    print(f"      {self._c('GDPR concern:', 'blue')} {c.gdpr_concern}")
+                    print(f"      {self._c('PCI requirement:', 'magenta')} {c.pci_requirement}")
+                    print(f"      {self._c('Recommendation:', 'green')} {c.recommendation}")
+                    if c.requires_legal_review:
+                        print(f"      {self._c('🔍 Requires legal review', 'cyan')}")
             print()
 
         print(self._c("=" * 70, "bold", "blue"))

@@ -103,7 +103,11 @@ def cli():
     "--strict", is_flag=True, default=False,
     help="Exit with code 1 if any non-compliant flows are found.",
 )
-def validate(input_file, output_format, output_dir, organization, strict):
+@click.option(
+    "--verbose", "-v", is_flag=True, default=False,
+    help="Show detailed findings with descriptions and remediation steps.",
+)
+def validate(input_file, output_format, output_dir, organization, strict, verbose):
     """
     Validate all data flows in the architecture file for GDPR compliance.
 
@@ -142,7 +146,7 @@ def validate(input_file, output_format, output_dir, organization, strict):
 
     # Console output (always shown)
     summary = ConsoleSummary()
-    summary.print(report)
+    summary.print(report, verbose=verbose)
 
     # File outputs
     if output_format in ("html", "all"):

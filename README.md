@@ -298,7 +298,75 @@ Options (validate):
 
 ---
 
+## Design Decisions & Compliance Reasoning
+
+This section addresses the interpretive choices made when translating ambiguous GDPR requirements into automated logic.
+
+### 1. The Necessity Derogation Dilemma (Art. 49)
+
+This is the most contested area of Chapter V. Art. 49(1)(b) permits transfers "necessary for the performance of a contract" without additional safeguards. The ambiguity: payment processors routinely send transaction data to US vendors in real-time — is each individual transfer "necessary for the contract"?
+
+**EDPB's position (Opinion 1/2018, Rec. 01/2020 §111-116):** Art. 49 derogations are *residual exceptions*, not general authorizations. They must be:
+- **Occasional** — not systematic or repetitive
+- **Necessary** — not merely useful or convenient
+- **Proportionate** — limited to what is strictly required
+
+**Our decision:** We distinguish by transfer frequency:
+- `per_transaction`, `per_onboarding`, `per_event` → Accept as Art. 49 derogation (each transfer is tied to a specific contract performance)
+- `continuous`, `batch`, `real-time` → Reject Art. 49 and flag as requiring SCC/BCR
+
+**Why this matters for Yuno:** A payment gateway sending transaction data to Stripe continuously cannot rely on Art. 49 — this is a systematic transfer that requires SCCs. The EDPB explicitly rejected the argument that each individual payment constitutes a separate "contract performance" when the underlying relationship is a continuous service agreement.
+
+**Assumption documented:** We treat frequency as the primary indicator of "occasional." Volume (>10,000 records/month) is a secondary signal. Both thresholds are operational interpretations, not legal bright lines — they should be reviewed by legal counsel for each specific deployment.
+
+### 2. Schrems II and the Limits of SCCs
+
+The CJEU's *Schrems II* ruling (C-311/18, July 2020) established that SCCs are valid *in principle* but require a case-by-case Transfer Impact Assessment (TIA) to verify that the destination country's laws do not undermine the SCC protections in practice.
+
+**Our implementation:** We require a TIA for all transfers to countries with broad government surveillance laws (US FISA 702/EO 12333, China NSL, Russia SORM). A missing TIA generates a `HIGH` finding; a TIA older than 24 months generates a `MEDIUM` finding (EDPB recommends periodic review).
+
+**The EU-US DPF complication:** The Data Privacy Framework (July 2023) restored adequacy for DPF-certified US entities. We do *not* treat all US transfers as adequate — only those with explicit `dpf_certified: true`. Rationale: (1) DPF coverage is entity-specific, not country-wide; (2) Schrems III litigation is ongoing and the DPF's durability is uncertain; (3) conservative compliance posture is appropriate for a payment processor handling sensitive financial data.
+
+### 3. When to Escalate vs. Auto-Determine
+
+We use `REQUIRES_LEGAL_REVIEW` (distinct from `NON_COMPLIANT`) for genuinely ambiguous cases:
+- Art. 49 derogation claimed for non-occasional transfers (human judgment needed on "necessity")
+- GDPR/PCI DSS conflicts (resolution depends on specific retention policies and legal obligations)
+- Sensitive data (Art. 9) with unclear legal basis
+
+**Philosophy:** Automated tools that treat all compliance as binary create false confidence. The DPC doesn't want a tool that says "compliant" when the correct answer is "it depends on your specific retention policy and DPA clauses." We prefer surfacing ambiguity over auto-determining compliance in contested areas.
+
+### 4. GDPR vs. PCI DSS Structural Conflict
+
+Payment processors face a genuine tension that cannot be resolved by automation alone:
+
+| Requirement | GDPR | PCI DSS |
+|---|---|---|
+| Log retention | Delete when no longer necessary (Art. 5(1)(e)) | 12 months minimum (Req. 10.7) |
+| Transaction data | Purpose limitation (Art. 5(1)(b)) | Retain for fraud investigation (Req. 3.2) |
+| Cardholder data | Erasure right (Art. 17) | Cannot delete if needed for dispute resolution |
+
+We flag these conflicts as `requires_legal_review: true` rather than marking flows as non-compliant. The resolution requires: (1) a documented legal obligation basis under Art. 6(1)(c) for PCI retention; (2) contractual clauses in the DPA specifying the retention period; (3) legal review to confirm the PCI period satisfies GDPR's storage limitation principle.
+
+### 5. Pre-2021 SCCs
+
+The transition period for old SCCs ended **December 27, 2022**. Any transfer still using pre-2021 SCCs has been unlawful for over 3 years. We treat this as `CRITICAL` — not `HIGH` — because it is not an ambiguous case: the Commission's decision is unambiguous, and the deadline has long passed.
+
+### 6. Assumptions and Scope Limitations
+
+| Assumption | Rationale |
+|---|---|
+| `to_country` is authoritative for destination | We cannot infer server location from service name |
+| EEA = EU + IS + LI + NO | Standard GDPR scope |
+| TIA threshold: US, CN, RU, IN | EDPB Rec. 01/2020 Step 3 country assessment |
+| Minimization threshold: >3 recipients = concern | Operational interpretation; not a legal bright line |
+| DPF requires explicit certification flag | Conservative posture given ongoing litigation |
+| Art. 49 "occasional" = non-continuous frequency | EDPB Opinion 1/2018 interpretation |
+
+---
+
 ## Legal References
+
 
 | Reference | Description |
 |---|---|

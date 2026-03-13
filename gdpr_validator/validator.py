@@ -112,34 +112,131 @@ INDEFINITE_RETENTION_KEYWORDS = {"indefinite", "unlimited", "forever", "no limit
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ArchitectureLoader:
-    """Loads and parses the input JSON/YAML architecture file."""
+    """Loads and parses the input JSON/YAML architecture file.
+
+    Supports both JSON and YAML input formats. Provides detailed error
+    messages for malformed input, missing required fields, and invalid
+    data to help users quickly identify and fix issues.
+    """
+
+    # Required fields for each entity type
+    SERVICE_REQUIRED_FIELDS = {"name", "region", "country"}
+    VENDOR_REQUIRED_FIELDS = {"name", "country"}
+    FLOW_REQUIRED_FIELDS = {"id", "from", "to", "to_country"}
 
     @staticmethod
     def load_json(filepath: str) -> dict:
+        """Load and parse a JSON architecture file.
+
+        Args:
+            filepath: Absolute or relative path to the JSON file.
+
+        Returns:
+            Parsed dictionary containing the architecture definition.
+
+        Raises:
+            json.JSONDecodeError: If the file contains invalid JSON syntax.
+            FileNotFoundError: If the file does not exist.
+            PermissionError: If the file cannot be read.
+        """
         import json
         with open(filepath, "r", encoding="utf-8") as f:
             return json.load(f)
 
     @staticmethod
     def load_yaml(filepath: str) -> dict:
+        """Load and parse a YAML architecture file.
+
+        Args:
+            filepath: Absolute or relative path to the YAML file.
+
+        Returns:
+            Parsed dictionary containing the architecture definition.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            yaml.YAMLError: If the file contains invalid YAML syntax.
+        """
         try:
             import yaml
             with open(filepath, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f)
         except ImportError:
-            raise ImportError("PyYAML is required for YAML input. Install with: pip install pyyaml")
+            raise ImportError(
+                "PyYAML is required for YAML input. "
+                "Install with: pip install pyyaml"
+            )
 
     @classmethod
     def load(cls, filepath: str) -> dict:
+        """Load an architecture file, auto-detecting format from extension.
+
+        Args:
+            filepath: Path to the architecture file (.json, .yaml, or .yml).
+
+        Returns:
+            Parsed dictionary containing the architecture definition.
+
+        Raises:
+            json.JSONDecodeError: For malformed JSON files.
+            yaml.YAMLError: For malformed YAML files.
+            FileNotFoundError: If the file does not exist.
+        """
         if filepath.endswith(".yaml") or filepath.endswith(".yml"):
             return cls.load_yaml(filepath)
         return cls.load_json(filepath)
 
     @classmethod
+    def _validate_required_fields(
+        cls, entity: dict, required: set, entity_type: str, index: int
+    ) -> None:
+        """Validate that a dict contains all required fields.
+
+        Args:
+            entity: The dictionary to validate.
+            required: Set of required field names.
+            entity_type: Human-readable entity type name (e.g., 'service').
+            index: Zero-based index of the entity in its list (for error messages).
+
+        Raises:
+            ValueError: If any required fields are missing, with a descriptive
+                message listing all missing fields and their expected types.
+        """
+        missing = required - set(entity.keys())
+        if missing:
+            name = entity.get("name") or entity.get("id") or f"#{index}"
+            raise ValueError(
+                f"Invalid {entity_type} '{name}' at index {index}: "
+                f"missing required field(s): {sorted(missing)}. "
+                f"All {entity_type}s must have: {sorted(required)}."
+            )
+
+    @classmethod
     def parse(cls, data: dict) -> tuple:
-        """Parse raw dict into typed model objects."""
+        """Parse raw architecture dict into typed model objects.
+
+        Validates required fields and provides actionable error messages
+        for any malformed or incomplete entries.
+
+        Args:
+            data: Raw dictionary loaded from the architecture file. Expected
+                keys: 'organization', 'services', 'third_party_vendors',
+                'data_flows'.
+
+        Returns:
+            A 4-tuple of (services, vendors, flows, org) where:
+                - services: Dict[str, Service] keyed by service name
+                - vendors: Dict[str, ThirdPartyVendor] keyed by vendor name
+                - flows: List[DataFlow]
+                - org: dict with organization metadata
+
+        Raises:
+            ValueError: If any entity is missing required fields.
+            TypeError: If field values have unexpected types.
+        """
         services: Dict[str, Service] = {}
-        for s in data.get("services", []):
+        for i, s in enumerate(data.get("services", [])):
+            cls._validate_required_fields(s, cls.SERVICE_REQUIRED_FIELDS, "service", i)
             svc = Service(
                 name=s["name"],
                 display_name=s.get("display_name", s["name"]),
@@ -156,7 +253,8 @@ class ArchitectureLoader:
             services[svc.name] = svc
 
         vendors: Dict[str, ThirdPartyVendor] = {}
-        for v in data.get("third_party_vendors", []):
+        for i, v in enumerate(data.get("third_party_vendors", [])):
+            cls._validate_required_fields(v, cls.VENDOR_REQUIRED_FIELDS, "vendor", i)
             vendor = ThirdPartyVendor(
                 name=v["name"],
                 display_name=v.get("display_name", v["name"]),
@@ -171,7 +269,8 @@ class ArchitectureLoader:
             vendors[vendor.name] = vendor
 
         flows: List[DataFlow] = []
-        for f in data.get("data_flows", []):
+        for i, f in enumerate(data.get("data_flows", [])):
+            cls._validate_required_fields(f, cls.FLOW_REQUIRED_FIELDS, "data_flow", i)
             flow = DataFlow(
                 id=f["id"],
                 from_service=f["from"],
