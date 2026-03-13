@@ -1,6 +1,6 @@
 # GDPR Cross-Border Data Transfer Validator
 
-A production-grade Python tool for auditing cross-border data flows against **GDPR Chapter V (Arts. 44–50)**, built as a response to the [Yuno Engineering Challenge](https://yuno-challenge.vercel.app/challenge/cmmmqjmvl0004lnjswx8qfrew).
+A production-grade Python tool for auditing cross-border data flows against **GDPR Chapter V (Arts. 44–50)**, built as a response to the Yuno Engineering Challenge
 
 ---
 
